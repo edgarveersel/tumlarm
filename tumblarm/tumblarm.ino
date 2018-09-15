@@ -5,6 +5,8 @@
   *
   *  Version: 0.0.1
   *
+  * Capacitor issue: http://forum.arduino.cc/index.php?topic=394691.0
+  *
   */
 //****************************************
 //        INCLUDES
@@ -13,6 +15,7 @@
 // uncomment the following to disable serial DEBUG statements
 //#define SERIAL_DEBUG false
 #include <SerialDebug.h>
+#include "MPU6050.h"
 
 
 //****************************************
@@ -25,8 +28,8 @@ const uint8_t MPU_addr = 0x68; // I2C address of the MPU-6050
 //USER SETTINGS
 const unsigned long culAlarmDuration = 1000; //millis of beep duration
 const unsigned long culCheckGyro = 300; //millis to check the Gyro position
-const float AcMargin = 0.2; //all dimensions margin for the Accellerator
-const float GyMargin = 0.2; //all dimensions margin for the Gyro
+const float AcMargin = 0.04; //all dimensions margin for the Accellerator
+const float GyMargin = 0.04; //all dimensions margin for the Gyro
 
 
 //****************************************
