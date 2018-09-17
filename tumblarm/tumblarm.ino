@@ -28,8 +28,8 @@ const uint8_t MPU_addr = 0x68; // I2C address of the MPU-6050
 //USER SETTINGS
 const unsigned long culAlarmDuration = 1000; //millis of beep duration
 const unsigned long culCheckGyro = 300; //millis to check the Gyro position
-const float AcMargin = 0.04; //all dimensions margin for the Accellerator
-const float GyMargin = 0.04; //all dimensions margin for the Gyro
+const float AcMargin = 2.5; //all dimensions margin for the Accellerator
+const float GyMargin = 2.5; //all dimensions margin for the Gyro
 
 
 //****************************************
@@ -125,7 +125,7 @@ void loop() {
       ulLastGyroCheck = millis();
    }
 
-   if (fAlarmTriggered && culAlarmDuration <= millis())
+   if (fAlarmTriggered && (ulAlarmEndMillis <= millis()))
       SetAlarmTrigger(false, 0);
 
 
@@ -263,6 +263,12 @@ void SetAlarmTrigger (bool fArm, unsigned long ulDuration){
     pinMode(AlarmTriggerPin, OUTPUT);
     digitalWrite(AlarmTriggerPin, LOW);
     fAlarmTriggered = false;
+
+    RestState =  mpu6050Read(MPU_addr);
+    DEBUG(millis(), "New gyro values stored", RestState.AcX, RestState.AcY, RestState.AcZ);
+
+
+
   }
 
 };
