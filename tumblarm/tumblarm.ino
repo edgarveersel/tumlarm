@@ -1,28 +1,31 @@
- /* Experimental ESP8266 piece of code
+/* Experimental ESP8266 piece of code
   *
   *  Start Date: 2018-09-07
   *  Coding: Edgar, Nick
   *
-  *  Version: 0.0.1
+  *  Version: 0.1.0
+  *  Version Date: 2018-10-1
   *
   * Capacitor issue: http://forum.arduino.cc/index.php?topic=394691.0
   *
   */
+
+// The accuracy is 16-bits.
+
 //****************************************
 //        INCLUDES
 //****************************************
-#include "Wire.h"
-// uncomment the following to disable serial DEBUG statements
-//#define SERIAL_DEBUG false
-#include <SerialDebug.h>
-#include "MPU6050.h"
-
+#include <Wire.h>
 
 //****************************************
-//        CONSTANTS / CONFIGURATION
+//        DEFINES
 //****************************************
-//SYSTEM SETTINGS
-const uint8_t MPU_addr = 0x68; // I2C address of the MPU-6050
+#define MPU6050_ACCEL_XOUT_H       0x3B   // R
+#define MPU6050_WHO_AM_I           0x75   // R
+#define MPU6050_I2C_ADDRESS        0x68
+#define MPU6050_PWR_MGMT_1         0x6B   // R/W
+#define MPU6050_PWR_MGMT_2         0x6C   // R/W
+
 #define AlarmTriggerPin D8
 
 //USER SETTINGS
@@ -31,102 +34,154 @@ const unsigned long culCheckGyro = 300; //millis to check the Gyro position
 const float AcMargin = 2.5; //all dimensions margin for the Accellerator
 const float GyMargin = 2.5; //all dimensions margin for the Gyro
 
-
 //****************************************
-//        STRUCTURES
+//        TYPE DECLARATIONS
 //****************************************
-struct rawdata {
-  int16_t iAcX;
-  int16_t iAcY;
-  int16_t iAcZ;
-  int16_t iTmp;
-  int16_t iGyX;
-  int16_t iGyY;
-  int16_t iGyZ;
+typedef union accel_t_gyro_union
+{
+  struct
+  {
+    uint8_t x_accel_h;
+    uint8_t x_accel_l;
+    uint8_t y_accel_h;
+    uint8_t y_accel_l;
+    uint8_t z_accel_h;
+    uint8_t z_accel_l;
+    uint8_t t_h;
+    uint8_t t_l;
+    uint8_t x_gyro_h;
+    uint8_t x_gyro_l;
+    uint8_t y_gyro_h;
+    uint8_t y_gyro_l;
+    uint8_t z_gyro_h;
+    uint8_t z_gyro_l;
+  } reg;
+  struct
+  {
+    int16_t x_accel;
+    int16_t y_accel;
+    int16_t z_accel;
+    int16_t temperature;
+    int16_t x_gyro;
+    int16_t y_gyro;
+    int16_t z_gyro;
+  } value;
 };
 
-struct scaleddata{
-  float AcX;
-  float AcY;
-  float AcZ;
-  float Tmp;
-  float GyX;
-  float GyY;
-  float GyZ;
-};
+//****************************************
+//        GLOBALS
+//****************************************
+unsigned long last_read_time;
+float         last_x_angle;  // These are the filtered angles
+float         last_y_angle;
+float         last_z_angle;
+float         last_gyro_x_angle;  // Store the gyro angles to compare drift
+float         last_gyro_y_angle;
+float         last_gyro_z_angle;
 
-//****************************************
-//        GLOBAL VARIABLES
-//****************************************
-scaleddata RestState;
+//  Use the following global variables and access functions
+//  to calibrate the acceleration sensor
+float    base_x_accel;
+float    base_y_accel;
+float    base_z_accel;
+
+float    base_x_gyro;
+float    base_y_gyro;
+float    base_z_gyro;
+
 unsigned long ulLastGyroCheck = 0;
 unsigned long ulAlarmEndMillis = 0;
 bool fAlarmTriggered = false;
 
+//****************************************
+//        FUNCTION DECLARATIONS
+//****************************************
+void set_last_read_angle_data(unsigned long time, float x, float y, float z, float x_gyro, float y_gyro, float z_gyro);
 
-//****************************************
-//        FUNCTON DECLARATIONS
-//****************************************
-bool checkI2c(byte addr);
-void mpu6050Begin(byte addr);
-scaleddata mpu6050Read(byte addr);
-bool CheckAccMovementOutOfBound(scaleddata State, float Xmargin, float Ymargin, float Zmargin);
-bool CheckGyroMovementOutOfBound(scaleddata State, float Xmargin, float Ymargin, float Zmargin);
-void SetAlarmTrigger (bool fArm);
+inline unsigned long get_last_time() {return last_read_time;}
+inline float get_last_x_angle() {return last_x_angle;}
+inline float get_last_y_angle() {return last_y_angle;}
+inline float get_last_z_angle() {return last_z_angle;}
+inline float get_last_gyro_x_angle() {return last_gyro_x_angle;}
+inline float get_last_gyro_y_angle() {return last_gyro_y_angle;}
+inline float get_last_gyro_z_angle() {return last_gyro_z_angle;}
+void calibrate_sensors();
+int read_gyro_accel_vals(uint8_t* accel_t_gyro_ptr);
+void ReadAccGyrValues(void);
 
 //****************************************
 //        SETUP
 //****************************************
-void setup() {
+void setup()
+{
+  int error;
+  uint8_t c;
+
+  Serial.begin(115200);
+
+  // Initialize the 'Wire' class for the I2C-bus.
   Wire.begin();
 
-  SERIAL_DEBUG_SETUP(9600);
-  DEBUG(millis(), "Let the gyro stabilize for 3 sec...");
 
-  mpu6050Begin(MPU_addr);
-  delay(3000);
+  // default at power-up:
+  //    Gyro at 250 degrees second
+  //    Acceleration at 2g
+  //    Clock source at internal 8MHz
+  //    The device is in sleep mode.
+  //
 
-  RestState =  mpu6050Read(MPU_addr);
-  DEBUG(millis(), "Gyro values stored", RestState.AcX, RestState.AcY, RestState.AcZ);
+  error = MPU6050_read (MPU6050_WHO_AM_I, &c, 1);
 
-  analogWriteRange(1000);
+  Serial.print(F("error = "));
+  Serial.println(error, DEC);
 
-  //two beeps
-  SetAlarmTrigger (true, 500);
-  delay(500);
-  SetAlarmTrigger (false, 500);
-  delay(500);
-  SetAlarmTrigger (true, 500);
-  delay(500);
-  SetAlarmTrigger (false, 500);
-  delay(1000);
+  // Serial.print(F("WHO_AM_I : "));
+  // Serial.print(c,HEX);
+  // Serial.print(F(", error = "));
+  // Serial.println(error,DEC);
 
+
+  // According to the datasheet, the 'sleep' bit
+  // should read a '1'. But I read a '0'.
+  // That bit has to be cleared, since the sensor
+  // is in sleep mode at power-up. Even if the
+  // bit reads '0'.
+  error = MPU6050_read (MPU6050_PWR_MGMT_2, &c, 1);
+  /*
+  Serial.print(F("PWR_MGMT_2 : "));
+  Serial.print(c,HEX);
+  Serial.print(F(", error = "));
+  Serial.println(error,DEC);
+  */
+
+  // Clear the 'sleep' bit to start the sensor.
+  MPU6050_write_reg (MPU6050_PWR_MGMT_1, 0);
+
+  //Initialize the angles
+  calibrate_sensors();
+  set_last_read_angle_data(millis(), 0, 0, 0, 0, 0, 0);
 }
-
-
 
 //****************************************
 //        LOOP
 //****************************************
-void loop() {
-  rawdata newrawstate;
-
+void loop()
+{
   if ((ulLastGyroCheck + culCheckGyro <= millis()) && !fAlarmTriggered){
-      scaleddata rdNewState = mpu6050Read(MPU_addr);
-//      DEBUG ("Measured", rdNewState.AcX, rdNewState.AcY, rdNewState.AcZ);
+      ReadAccGyrValues();
 
-      bool fAccOutOfBound = CheckAccMovementOutOfBound(rdNewState, AcMargin, AcMargin, AcMargin);
+//      bool fAccOutOfBound = CheckAccMovementOutOfBound(rdNewState, AcMargin, AcMargin, AcMargin);
 //      bool fGyroOutOfBound = CheckGyroMovementOutOfBound(rdNewState, GyMargin, GyMargin, GyMargin);
 
 //      if (fAccOutOfBound || fGyroOutOfBound)
-      if (fAccOutOfBound)
-          SetAlarmTrigger(true, culAlarmDuration);
+//      if (fAccOutOfBound)
+//          SetAlarmTrigger(true, culAlarmDuration);
 
       ulLastGyroCheck = millis();
    }
 
-   if (fAlarmTriggered && (ulAlarmEndMillis <= millis()))
-      SetAlarmTrigger(false, 0);
+//   if (fAlarmTriggered && (ulAlarmEndMillis <= millis()))
+//      SetAlarmTrigger(false, 0);
 
 
 
@@ -134,141 +189,276 @@ void loop() {
 
 
 //****************************************
-//        FUNCTIONS
+//        functions
 //****************************************
+void ReadAccGyrValues(void)
+{
+  int error;
+  double dT;
+  accel_t_gyro_union accel_t_gyro;
 
-void mpu6050Begin(byte addr){
-  // This function initializes the MPU-6050 IMU Sensor
-  // It verifys the address is correct and wakes up the
-  // MPU.
-  if (checkI2c(addr)){
-    Wire.beginTransmission(addr);
-    Wire.write(0x6B); // PWR_MGMT_1 register
-    Wire.write(0); // set to zero (wakes up the MPU-6050)
-    Wire.endTransmission(true);
+  /*
+  Serial.println(F(""));
+  Serial.println(F("MPU-6050"));
+  */
 
-  delay(30); // Ensure gyro has enough time to power up
-  }
+  // Read the raw values.
+  error = read_gyro_accel_vals((uint8_t*) &accel_t_gyro);
+
+  // Get the time of reading for rotation computations
+  unsigned long t_now = millis();
+
+  // Convert gyro values to degrees/sec
+  float FS_SEL = 131;
+
+  float gyro_x = (accel_t_gyro.value.x_gyro - base_x_gyro)/FS_SEL;
+  float gyro_y = (accel_t_gyro.value.y_gyro - base_y_gyro)/FS_SEL;
+  float gyro_z = (accel_t_gyro.value.z_gyro - base_z_gyro)/FS_SEL;
+
+
+  // Get raw acceleration values
+  //float G_CONVERT = 16384;
+  float accel_x = accel_t_gyro.value.x_accel;
+  float accel_y = accel_t_gyro.value.y_accel;
+  float accel_z = accel_t_gyro.value.z_accel;
+
+  // Get angle values from accelerometer
+  float RADIANS_TO_DEGREES = 180/3.14159;
+  //float accel_vector_length = sqrt(pow(accel_x,2) + pow(accel_y,2) + pow(accel_z,2));
+  float accel_angle_y = atan(-1*accel_x/sqrt(pow(accel_y,2) + pow(accel_z,2)))*RADIANS_TO_DEGREES;
+  float accel_angle_x = atan(accel_y/sqrt(pow(accel_x,2) + pow(accel_z,2)))*RADIANS_TO_DEGREES;
+
+  float accel_angle_z = atan(sqrt(pow(accel_x,2) + pow(accel_y,2))/accel_z)*RADIANS_TO_DEGREES;;
+  //float accel_angle_z = 0;
+
+  // Compute the (filtered) gyro angles
+  float dt =(t_now - get_last_time())/1000.0;
+  float gyro_angle_x = gyro_x*dt + get_last_x_angle();
+  float gyro_angle_y = gyro_y*dt + get_last_y_angle();
+  float gyro_angle_z = gyro_z*dt + get_last_z_angle();
+
+  // Compute the drifting gyro angles
+  float unfiltered_gyro_angle_x = gyro_x*dt + get_last_gyro_x_angle();
+  float unfiltered_gyro_angle_y = gyro_y*dt + get_last_gyro_y_angle();
+  float unfiltered_gyro_angle_z = gyro_z*dt + get_last_gyro_z_angle();
+
+  // Apply the complementary filter to figure out the change in angle - choice of alpha is
+  // estimated now.  Alpha depends on the sampling rate...
+  float alpha = 0.96;
+  float angle_x = alpha*gyro_angle_x + (1.0 - alpha)*accel_angle_x;
+  float angle_y = alpha*gyro_angle_y + (1.0 - alpha)*accel_angle_y;
+  float angle_z = gyro_angle_z;  //Accelerometer doesn't give z-angle
+
+  // Update the saved data with the latest values
+  set_last_read_angle_data(t_now, angle_x, angle_y, angle_z, unfiltered_gyro_angle_x, unfiltered_gyro_angle_y, unfiltered_gyro_angle_z);
+
+
+  // Send the data to the serial port
+  Serial.print(F("DEL:"));              //Delta T
+  Serial.print(dt, DEC);
+  Serial.print(F("#ACC:"));              //Accelerometer angle
+  Serial.print(accel_angle_x, 2);
+  Serial.print(F(","));
+  Serial.print(accel_angle_y, 2);
+  Serial.print(F(","));
+  Serial.print(accel_angle_z, 2);
+  Serial.print(F("#GYR:"));
+  Serial.print(unfiltered_gyro_angle_x, 2);        //Gyroscope angle
+  Serial.print(F(","));
+  Serial.print(unfiltered_gyro_angle_y, 2);
+  Serial.print(F(","));
+  Serial.print(unfiltered_gyro_angle_z, 2);
+  Serial.print(F("#FIL:"));             //Filtered angle
+  Serial.print(angle_x, 2);
+  Serial.print(F(","));
+  Serial.print(angle_y, 2);
+  Serial.print(F(","));
+  Serial.print(angle_z, 2);
+  Serial.println(F(""));
+
 }
 
-bool checkI2c(byte addr){
-  // We are using the return value of
-  // the Write.endTransmisstion to see if
-  // a device did acknowledge to the address.
-  Wire.beginTransmission(addr);
 
-  if (Wire.endTransmission() == 0)
+// --------------------------------------------------------
+// MPU6050_read
+//
+// This is a common function to read multiple bytes
+// from an I2C device.
+//
+// It uses the boolean parameter for Wire.endTransMission()
+// to be able to hold or release the I2C-bus.
+// This is implemented in Arduino 1.0.1.
+//
+// Only this function is used to read.
+// There is no function for a single byte.
+//
+int MPU6050_read(int start, uint8_t *buffer, int size)
+{
+  int i, n, error;
+
+  Wire.beginTransmission(MPU6050_I2C_ADDRESS);
+  n = Wire.write(start);
+  if (n != 1)
+    return (-10);
+
+  n = Wire.endTransmission(false);    // hold the I2C-bus
+  if (n != 0)
+    return (n);
+
+  // Third parameter is true: relase I2C-bus after data is read.
+  Wire.requestFrom(MPU6050_I2C_ADDRESS, size, true);
+  i = 0;
+  while(Wire.available() && i<size)
   {
-    return true;
+    buffer[i++]=Wire.read();
   }
-  else
-  {
-    DEBUG(millis(), "No Device Found at 0x", addr);
-    return false;
-  }
+  if ( i != size)
+    return (-11);
+
+  return (0);  // return : no error
 }
 
 
-  scaleddata mpu6050Read(byte addr){
-  // This function reads the raw 16-bit data values from
-  // the MPU-6050
+void set_last_read_angle_data(unsigned long time, float x, float y, float z, float x_gyro, float y_gyro, float z_gyro) {
+  last_read_time = time;
+  last_x_angle = x;
+  last_y_angle = y;
+  last_z_angle = z;
+  last_gyro_x_angle = x_gyro;
+  last_gyro_y_angle = y_gyro;
+  last_gyro_z_angle = z_gyro;
+}
 
-  rawdata State;
-  scaleddata ScaledState;
+// --------------------------------------------------------
+// MPU6050_write
+//
+// This is a common function to write multiple bytes to an I2C device.
+//
+// If only a single register is written,
+// use the function MPU_6050_write_reg().
+//
+// Parameters:
+//   start : Start address, use a define for the register
+//   pData : A pointer to the data to write.
+//   size  : The number of bytes to write.
+//
+// If only a single register is written, a pointer
+// to the data has to be used, and the size is
+// a single byte:
+//   int data = 0;        // the data to write
+//   MPU6050_write (MPU6050_PWR_MGMT_1, &c, 1);
+//
+int MPU6050_write(int start, const uint8_t *pData, int size)
+{
+  int n, error;
 
-  Wire.beginTransmission(addr);
-  Wire.write(0x3B); // starting with register 0x3B (ACCEL_XOUT_H)
-  Wire.endTransmission(false);
-  Wire.requestFrom(addr,14,true); // request a total of 14 registers
-  State.iAcX=Wire.read()<<8|Wire.read(); // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)
-  State.iAcY=Wire.read()<<8|Wire.read(); // 0x3D (ACCEL_YOUT_H) & 0x3E (ACCEL_YOUT_L)
-  State.iAcZ=Wire.read()<<8|Wire.read(); // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
-  State.iTmp=Wire.read()<<8|Wire.read(); // 0x41 (TEMP_OUT_H) & 0x42 (TEMP_OUT_L)
-  State.iGyX=Wire.read()<<8|Wire.read(); // 0x43 (GYRO_XOUT_H) & 0x44 (GYRO_XOUT_L)
-  State.iGyY=Wire.read()<<8|Wire.read(); // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
-  State.iGyZ=Wire.read()<<8|Wire.read(); // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+  Wire.beginTransmission(MPU6050_I2C_ADDRESS);
+  n = Wire.write(start);        // write the start address
+  if (n != 1)
+    return (-20);
 
-  ScaledState.AcX = State.iAcX / 256.0;
-  ScaledState.AcY = State.iAcY / 256.0;
-  ScaledState.AcZ = State.iAcZ / 256.0;
-  ScaledState.GyX = State.iGyX / 256.0;
-  ScaledState.GyY = State.iGyY / 256.0;
-  ScaledState.GyZ = State.iGyZ / 256.0;
+  n = Wire.write(pData, size);  // write data bytes
+  if (n != size)
+    return (-21);
 
-  return ScaledState;
-};
+  error = Wire.endTransmission(true); // release the I2C-bus
+  if (error != 0)
+    return (error);
+
+  return (0);         // return : no error
+}
+
+// --------------------------------------------------------
+// MPU6050_write_reg
+//
+// An extra function to write a single register.
+// It is just a wrapper around the MPU_6050_write()
+// function, and it is only a convenient function
+// to make it easier to write a single register.
+//
+int MPU6050_write_reg(int reg, uint8_t data)
+{
+  int error;
+
+  error = MPU6050_write(reg, &data, 1);
+
+  return (error);
+}
 
 
-bool CheckAccMovementOutOfBound(scaleddata State, float Xmargin, float Ymargin, float Zmargin){
-  //built for speed
-  //Will be within bounds most of the times - inner cube: 0.5 * sqrt(2)
-  bool fX = abs(State.AcX - RestState.AcX) <= 0.7 * Xmargin;
-  bool fY = abs(State.AcY - RestState.AcY) <= 0.7 * Ymargin;
-  bool fZ = abs(State.AcZ - RestState.AcZ) <= 0.7 * Zmargin;
 
-  if (fX && fY && fZ){
-    DEBUG (millis(), "Within inner cube", abs(State.AcX - RestState.AcX), abs(State.AcY - RestState.AcY), abs(State.AcZ - RestState.AcZ));
-    return false; //within a cube that is completely inside the allowed sphere
+int read_gyro_accel_vals(uint8_t* accel_t_gyro_ptr) {
+  // Read the raw values.
+  // Read 14 bytes at once,
+  // containing acceleration, temperature and gyro.
+  // With the default settings of the MPU-6050,
+  // there is no filter enabled, and the values
+  // are not very stable.  Returns the error value
+
+  accel_t_gyro_union* accel_t_gyro = (accel_t_gyro_union *) accel_t_gyro_ptr;
+
+  int error = MPU6050_read (MPU6050_ACCEL_XOUT_H, (uint8_t *) accel_t_gyro, sizeof(*accel_t_gyro));
+
+  // Swap all high and low bytes.
+  // After this, the registers values are swapped,
+  // so the structure name like x_accel_l does no
+  // longer contain the lower byte.
+  uint8_t swap;
+  #define SWAP(x,y) swap = x; x = y; y = swap
+
+  SWAP ((*accel_t_gyro).reg.x_accel_h, (*accel_t_gyro).reg.x_accel_l);
+  SWAP ((*accel_t_gyro).reg.y_accel_h, (*accel_t_gyro).reg.y_accel_l);
+  SWAP ((*accel_t_gyro).reg.z_accel_h, (*accel_t_gyro).reg.z_accel_l);
+  SWAP ((*accel_t_gyro).reg.t_h, (*accel_t_gyro).reg.t_l);
+  SWAP ((*accel_t_gyro).reg.x_gyro_h, (*accel_t_gyro).reg.x_gyro_l);
+  SWAP ((*accel_t_gyro).reg.y_gyro_h, (*accel_t_gyro).reg.y_gyro_l);
+  SWAP ((*accel_t_gyro).reg.z_gyro_h, (*accel_t_gyro).reg.z_gyro_l);
+
+  return error;
+}
+
+// The sensor should be motionless on a horizontal surface
+//  while calibration is happening
+void calibrate_sensors() {
+  int                   num_readings = 10;
+  float                 x_accel = 0;
+  float                 y_accel = 0;
+  float                 z_accel = 0;
+  float                 x_gyro = 0;
+  float                 y_gyro = 0;
+  float                 z_gyro = 0;
+  accel_t_gyro_union    accel_t_gyro;
+
+  //Serial.println("Starting Calibration");
+
+  // Discard the first set of values read from the IMU
+  read_gyro_accel_vals((uint8_t *) &accel_t_gyro);
+
+  // Read and average the raw values from the IMU
+  for (int i = 0; i < num_readings; i++) {
+    read_gyro_accel_vals((uint8_t *) &accel_t_gyro);
+    x_accel += accel_t_gyro.value.x_accel;
+    y_accel += accel_t_gyro.value.y_accel;
+    z_accel += accel_t_gyro.value.z_accel;
+    x_gyro += accel_t_gyro.value.x_gyro;
+    y_gyro += accel_t_gyro.value.y_gyro;
+    z_gyro += accel_t_gyro.value.z_gyro;
+    delay(100);
   }
-  else
-  {
-    ///Hmm, let's try outside of the full cube
-    fX = abs(State.AcX - RestState.AcX) > Xmargin;
-    fY = abs(State.AcY - RestState.AcY) > Ymargin;
-    fZ = abs(State.AcZ - RestState.AcZ) > Zmargin;
+  x_accel /= num_readings;
+  y_accel /= num_readings;
+  z_accel /= num_readings;
+  x_gyro /= num_readings;
+  y_gyro /= num_readings;
+  z_gyro /= num_readings;
 
-    if (fX || fY || fZ){
-      DEBUG (millis(), "Outside outer cube",
-                  abs(State.AcX - RestState.AcX),
-                  abs(State.AcY - RestState.AcY),
-                  abs(State.AcZ - RestState.AcZ));
-      return true;
-    }
-    else
-    {//Dang, have to calculate the ball coordinates...
-      float radius = sqrt(sq(State.AcX - RestState.AcX) + sq(State.AcY - RestState.AcY) + sq(State.AcZ - RestState.AcZ));
+  // Store the raw calibration values globally
+  base_x_accel = x_accel;
+  base_y_accel = y_accel;
+  base_z_accel = z_accel;
+  base_x_gyro = x_gyro;
+  base_y_gyro = y_gyro;
+  base_z_gyro = z_gyro;
 
-      DEBUG(millis(), "Raduis", radius,
-                      abs(State.AcX - RestState.AcX),
-                      abs(State.AcY - RestState.AcY),
-                      abs(State.AcZ - RestState.AcZ),
-                      radius <= AcMargin);
-
-      return (radius <= AcMargin);
-    }
-  }
-};
-
-bool CheckGyroMovementOutOfBound(scaleddata State, float Xmargin, float Ymargin,float Zmargin){
-
-  bool fX = abs(State.GyX - RestState.GyX) > Xmargin;
-  bool fY = abs(State.GyY - RestState.GyY) > Ymargin;
-  bool fZ = abs(State.GyZ - RestState.GyZ) > Zmargin;
-
-  return (fX || fY || fZ);
-
-};
-
-void SetAlarmTrigger (bool fArm, unsigned long ulDuration){
-
-  if (fArm){  //switch ON AlarmTriggerPin
-    analogWriteRange(1000);
-    analogWrite(AlarmTriggerPin, 512);
-    ulAlarmEndMillis = millis() + ulDuration;
-    fAlarmTriggered = true;
-  }
-  else
-  { //switch OFF AlarmTriggerPin
-    analogWrite(AlarmTriggerPin, 0);
-    pinMode(AlarmTriggerPin, OUTPUT);
-    digitalWrite(AlarmTriggerPin, LOW);
-    fAlarmTriggered = false;
-
-    RestState =  mpu6050Read(MPU_addr);
-    DEBUG(millis(), "New gyro values stored", RestState.AcX, RestState.AcY, RestState.AcZ);
-
-
-
-  }
-
-};
+  Serial.print(F("Finishing Calibration"));
+}
