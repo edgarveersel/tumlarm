@@ -31,8 +31,8 @@
 //USER SETTINGS
 const unsigned long culAlarmDuration = 1000; //millis of beep duration
 const unsigned long culCheckGyro = 300; //millis to check the Gyro position
-const float AcMargin = 2.5; //all dimensions margin for the Accellerator
-const float GyMargin = 2.5; //all dimensions margin for the Gyro
+const float AcMargin = 2.5; //all dimensions margin for the Accellerator in ??
+const float GyMargin = 2.5; //all dimensions margin for the Gyro in degrees
 
 //****************************************
 //        TYPE DECLARATIONS
@@ -71,6 +71,10 @@ typedef union accel_t_gyro_union
 //****************************************
 //        GLOBALS
 //****************************************
+unsigned long ulLastGyroCheck = 0;
+unsigned long ulAlarmEndMillis = 0;
+bool fAlarmTriggered = false;
+
 unsigned long last_read_time;
 float         last_x_angle;  // These are the filtered angles
 float         last_y_angle;
@@ -79,19 +83,14 @@ float         last_gyro_x_angle;  // Store the gyro angles to compare drift
 float         last_gyro_y_angle;
 float         last_gyro_z_angle;
 
-//  Use the following global variables and access functions
+//  Use the following global variables and corresponding access functions
 //  to calibrate the acceleration sensor
 float    base_x_accel;
 float    base_y_accel;
 float    base_z_accel;
-
 float    base_x_gyro;
 float    base_y_gyro;
 float    base_z_gyro;
-
-unsigned long ulLastGyroCheck = 0;
-unsigned long ulAlarmEndMillis = 0;
-bool fAlarmTriggered = false;
 
 //****************************************
 //        FUNCTION DECLARATIONS
@@ -106,8 +105,15 @@ inline float get_last_gyro_x_angle() {return last_gyro_x_angle;}
 inline float get_last_gyro_y_angle() {return last_gyro_y_angle;}
 inline float get_last_gyro_z_angle() {return last_gyro_z_angle;}
 void calibrate_sensors();
-int read_gyro_accel_vals(uint8_t* accel_t_gyro_ptr);
+int read_gyro_accel_raw_vals(uint8_t* accel_t_gyro_ptr);
 void ReadAccGyrValues(void);
+
+bool CheckAccMovementOutOfBound(float x, float y, float z);
+bool CheckGyroMovementOutOfBound(float x, float y, float z);
+void SetAlarmTrigger (bool fArm);
+void convert_raw_2_real_values_and_store(unsigned long time_now,
+                  float raw_gyro_x, float raw_gyro_y, float raw_gyro_z,
+                  float raw_accel_x, float raw_accel_y, float raw_accel_z);
 
 //****************************************
 //        SETUP
@@ -118,18 +124,17 @@ void setup()
   uint8_t c;
 
   Serial.begin(115200);
+  Serial.println();
+  Serial.println();
 
   // Initialize the 'Wire' class for the I2C-bus.
   Wire.begin();
-
 
   // default at power-up:
   //    Gyro at 250 degrees second
   //    Acceleration at 2g
   //    Clock source at internal 8MHz
   //    The device is in sleep mode.
-  //
-
   error = MPU6050_read (MPU6050_WHO_AM_I, &c, 1);
 
   Serial.print(F("error = "));
@@ -147,12 +152,6 @@ void setup()
   // is in sleep mode at power-up. Even if the
   // bit reads '0'.
   error = MPU6050_read (MPU6050_PWR_MGMT_2, &c, 1);
-  /*
-  Serial.print(F("PWR_MGMT_2 : "));
-  Serial.print(c,HEX);
-  Serial.print(F(", error = "));
-  Serial.println(error,DEC);
-  */
 
   // Clear the 'sleep' bit to start the sensor.
   MPU6050_write_reg (MPU6050_PWR_MGMT_1, 0);
@@ -160,6 +159,20 @@ void setup()
   //Initialize the angles
   calibrate_sensors();
   set_last_read_angle_data(millis(), 0, 0, 0, 0, 0, 0);
+
+  convert_raw_2_real_values_and_store(0, base_x_gyro, base_y_gyro, base_z_gyro, base_x_accel, base_y_accel, base_z_accel);
+
+
+  //two beeps
+  SetAlarmTrigger (true, 500);
+  delay(500);
+  SetAlarmTrigger (false, 500);
+  delay(500);
+  SetAlarmTrigger (true, 500);
+  delay(500);
+  SetAlarmTrigger (false, 500);
+  delay(1000);
+
 }
 
 //****************************************
@@ -168,9 +181,10 @@ void setup()
 void loop()
 {
   if ((ulLastGyroCheck + culCheckGyro <= millis()) && !fAlarmTriggered){
+    //time to read the Gyro and Accellerator
       ReadAccGyrValues();
 
-//      bool fAccOutOfBound = CheckAccMovementOutOfBound(rdNewState, AcMargin, AcMargin, AcMargin);
+      bool fAccOutOfBound = CheckAccMovementOutOfBound(get_last_x_angle(), get_last_y_angle(), get_last_z_angle());
 //      bool fGyroOutOfBound = CheckGyroMovementOutOfBound(rdNewState, GyMargin, GyMargin, GyMargin);
 
 //      if (fAccOutOfBound || fGyroOutOfBound)
@@ -180,10 +194,8 @@ void loop()
       ulLastGyroCheck = millis();
    }
 
-//   if (fAlarmTriggered && (ulAlarmEndMillis <= millis()))
-//      SetAlarmTrigger(false, 0);
-
-
+  if (fAlarmTriggered && (ulAlarmEndMillis <= millis()))
+     SetAlarmTrigger(false, 0);
 
 }
 
@@ -197,42 +209,61 @@ void ReadAccGyrValues(void)
   double dT;
   accel_t_gyro_union accel_t_gyro;
 
-  /*
-  Serial.println(F(""));
-  Serial.println(F("MPU-6050"));
-  */
-
   // Read the raw values.
-  error = read_gyro_accel_vals((uint8_t*) &accel_t_gyro);
+  error = read_gyro_accel_raw_vals((uint8_t*) &accel_t_gyro);
 
   // Get the time of reading for rotation computations
   unsigned long t_now = millis();
 
+  // float gyro_x = (accel_t_gyro.value.x_gyro - base_x_gyro);
+  // float gyro_y = (accel_t_gyro.value.y_gyro - base_y_gyro);
+  // float gyro_z = (accel_t_gyro.value.z_gyro - base_z_gyro);
+  //
+  // // Get raw acceleration values
+  // //float G_CONVERT = 16384;
+  // float accel_x = accel_t_gyro.value.x_accel;
+  // float accel_y = accel_t_gyro.value.y_accel;
+  // float accel_z = accel_t_gyro.value.z_accel;
+
+  // Convert and update the saved data with the latest values
+  convert_raw_2_real_values_and_store(t_now, accel_t_gyro.value.x_gyro, accel_t_gyro.value.y_gyro, accel_t_gyro.value.z_gyro,
+                                        accel_t_gyro.value.x_accel, accel_t_gyro.value.y_accel, accel_t_gyro.value.z_accel);
+
+};
+
+
+
+void convert_raw_2_real_values_and_store(unsigned long time_now,
+                  float raw_gyro_x, float raw_gyro_y, float raw_gyro_z,
+                  float raw_accel_x, float raw_accel_y, float raw_accel_z)
+{
   // Convert gyro values to degrees/sec
   float FS_SEL = 131;
-
+  /*
   float gyro_x = (accel_t_gyro.value.x_gyro - base_x_gyro)/FS_SEL;
   float gyro_y = (accel_t_gyro.value.y_gyro - base_y_gyro)/FS_SEL;
   float gyro_z = (accel_t_gyro.value.z_gyro - base_z_gyro)/FS_SEL;
+  */
+  float gyro_x = (raw_gyro_x - base_x_gyro)/FS_SEL;
+  float gyro_y = (raw_gyro_y - base_y_gyro)/FS_SEL;
+  float gyro_z = (raw_gyro_z - base_z_gyro)/FS_SEL;
 
 
   // Get raw acceleration values
   //float G_CONVERT = 16384;
-  float accel_x = accel_t_gyro.value.x_accel;
-  float accel_y = accel_t_gyro.value.y_accel;
-  float accel_z = accel_t_gyro.value.z_accel;
+  float accel_x = raw_accel_x;
+  float accel_y = raw_accel_y;
+  float accel_z = raw_accel_z;
 
   // Get angle values from accelerometer
   float RADIANS_TO_DEGREES = 180/3.14159;
-  //float accel_vector_length = sqrt(pow(accel_x,2) + pow(accel_y,2) + pow(accel_z,2));
+  float accel_vector_length = sqrt(pow(accel_x,2) + pow(accel_y,2) + pow(accel_z,2));
   float accel_angle_y = atan(-1*accel_x/sqrt(pow(accel_y,2) + pow(accel_z,2)))*RADIANS_TO_DEGREES;
   float accel_angle_x = atan(accel_y/sqrt(pow(accel_x,2) + pow(accel_z,2)))*RADIANS_TO_DEGREES;
-
-  float accel_angle_z = atan(sqrt(pow(accel_x,2) + pow(accel_y,2))/accel_z)*RADIANS_TO_DEGREES;;
-  //float accel_angle_z = 0;
+  float accel_angle_z = 0;
 
   // Compute the (filtered) gyro angles
-  float dt =(t_now - get_last_time())/1000.0;
+  float dt =(time_now - get_last_time())/1000.0;
   float gyro_angle_x = gyro_x*dt + get_last_x_angle();
   float gyro_angle_y = gyro_y*dt + get_last_y_angle();
   float gyro_angle_z = gyro_z*dt + get_last_z_angle();
@@ -250,31 +281,21 @@ void ReadAccGyrValues(void)
   float angle_z = gyro_angle_z;  //Accelerometer doesn't give z-angle
 
   // Update the saved data with the latest values
-  set_last_read_angle_data(t_now, angle_x, angle_y, angle_z, unfiltered_gyro_angle_x, unfiltered_gyro_angle_y, unfiltered_gyro_angle_z);
-
+  set_last_read_angle_data(time_now, angle_x, angle_y, angle_z, unfiltered_gyro_angle_x, unfiltered_gyro_angle_y, unfiltered_gyro_angle_z);
 
   // Send the data to the serial port
-  Serial.print(F("DEL:"));              //Delta T
-  Serial.print(dt, DEC);
-  Serial.print(F("#ACC:"));              //Accelerometer angle
-  Serial.print(accel_angle_x, 2);
-  Serial.print(F(","));
-  Serial.print(accel_angle_y, 2);
-  Serial.print(F(","));
-  Serial.print(accel_angle_z, 2);
-  Serial.print(F("#GYR:"));
-  Serial.print(unfiltered_gyro_angle_x, 2);        //Gyroscope angle
-  Serial.print(F(","));
-  Serial.print(unfiltered_gyro_angle_y, 2);
-  Serial.print(F(","));
-  Serial.print(unfiltered_gyro_angle_z, 2);
-  Serial.print(F("#FIL:"));             //Filtered angle
-  Serial.print(angle_x, 2);
-  Serial.print(F(","));
-  Serial.print(angle_y, 2);
-  Serial.print(F(","));
-  Serial.print(angle_z, 2);
-  Serial.println(F(""));
+  Serial.print("time|");Serial.print(time_now);
+  Serial.print("| Acc|");Serial.print(angle_x);
+  Serial.print("|");Serial.print(angle_y);
+  Serial.print("|");Serial.print(angle_z);
+  Serial.print("| GyroFilt|");Serial.print(gyro_angle_x);
+  Serial.print("|");Serial.print(gyro_angle_y);
+  Serial.print("|");Serial.print(gyro_angle_z);
+  Serial.print("| GyroUnfilt|");Serial.print(unfiltered_gyro_angle_x);
+  Serial.print("|");Serial.print(unfiltered_gyro_angle_y);
+  Serial.print("|");Serial.print(unfiltered_gyro_angle_z);
+  Serial.print("| Vector|");Serial.println(accel_vector_length);
+
 
 }
 
@@ -387,7 +408,7 @@ int MPU6050_write_reg(int reg, uint8_t data)
 
 
 
-int read_gyro_accel_vals(uint8_t* accel_t_gyro_ptr) {
+int read_gyro_accel_raw_vals(uint8_t* accel_t_gyro_ptr) {
   // Read the raw values.
   // Read 14 bytes at once,
   // containing acceleration, temperature and gyro.
@@ -429,14 +450,14 @@ void calibrate_sensors() {
   float                 z_gyro = 0;
   accel_t_gyro_union    accel_t_gyro;
 
-  //Serial.println("Starting Calibration");
+  Serial.println("Starting Calibration");
 
   // Discard the first set of values read from the IMU
-  read_gyro_accel_vals((uint8_t *) &accel_t_gyro);
+  read_gyro_accel_raw_vals((uint8_t *) &accel_t_gyro);
 
   // Read and average the raw values from the IMU
   for (int i = 0; i < num_readings; i++) {
-    read_gyro_accel_vals((uint8_t *) &accel_t_gyro);
+    read_gyro_accel_raw_vals((uint8_t *) &accel_t_gyro);
     x_accel += accel_t_gyro.value.x_accel;
     y_accel += accel_t_gyro.value.y_accel;
     z_accel += accel_t_gyro.value.z_accel;
@@ -460,5 +481,64 @@ void calibrate_sensors() {
   base_y_gyro = y_gyro;
   base_z_gyro = z_gyro;
 
-  Serial.print(F("Finishing Calibration"));
+  Serial.println(F("Finished Calibration"));
 }
+
+
+// KLADJE!!!
+
+bool CheckAccMovementOutOfBound(float x, float y, float z){
+  //built for speed
+  //Will be within bounds most of the times - inner cube: 0.5 * sqrt(2) = 0.71
+  float dX = abs(x - base_x_accel);
+  float dY = abs(y - base_y_accel);
+  float dZ = abs(z - base_z_accel);
+
+  float radius = sqrt(sq(dX) + sq(dY) + sq(dZ));
+/*
+  Serial.print(millis());
+  Serial.print(" Raduis, ");
+  Serial.print(x,4);
+  Serial.print(" , ");
+  Serial.print(y,4);
+  Serial.print(" , ");
+  Serial.print(z,4);
+  Serial.print(" | ");
+  Serial.print(dX,4);
+  Serial.print(" , ");
+  Serial.print(dY,4);
+  Serial.print(" , ");
+  Serial.print(dZ,4);
+  Serial.print(" | ");
+    Serial.println(radius,4);
+*/
+  return (radius <= AcMargin);
+};
+
+// bool CheckGyroMovementOutOfBound(scaleddata State, float Xmargin, float Ymargin,float Zmargin){
+//
+//   bool fX = abs(State.GyX - RestState.GyX) > Xmargin;
+//   bool fY = abs(State.GyY - RestState.GyY) > Ymargin;
+//   bool fZ = abs(State.GyZ - RestState.GyZ) > Zmargin;
+//
+//   return (fX || fY || fZ);
+//
+// };
+
+void SetAlarmTrigger (bool fArm, unsigned long ulDuration){
+
+  if (fArm){  //switch ON AlarmTriggerPin
+    analogWriteRange(1000);
+    analogWrite(AlarmTriggerPin, 512);
+    ulAlarmEndMillis = millis() + ulDuration;
+    fAlarmTriggered = true;
+  }
+  else
+  { //switch OFF AlarmTriggerPin
+    analogWrite(AlarmTriggerPin, 0);
+    pinMode(AlarmTriggerPin, OUTPUT);
+    digitalWrite(AlarmTriggerPin, LOW);
+    fAlarmTriggered = false;
+  }
+
+};
